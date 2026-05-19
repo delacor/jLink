@@ -11,6 +11,7 @@ import "C"
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -218,8 +219,9 @@ var (
 	}
 
 	// Stop Channels
-	stopUpdateBattery     = make(chan struct{})
-	stopUpdatePairingList = make(chan struct{})
+	updateStopMu          sync.Mutex
+	stopUpdateBattery     chan struct{}
+	stopUpdatePairingList chan struct{}
 )
 
 /****************************************************************************/
@@ -255,28 +257,13 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 	goDeviceInfo.deviceEventsMask = getDeviceEventsMask(goDeviceInfo.deviceID)
 	goDeviceInfo.featureFlags = getSupportedFeature(goDeviceInfo.deviceID)
 
-	if !goDeviceInfo.isDongle {
-		battery, err := getBatteryStatus(goDeviceInfo.deviceID)
-		if err != nil {
-			fmt.Printf("Get Battery Status for %s: %s\n", goDeviceInfo.deviceName, err)
-		} else {
-			goDeviceInfo.batteryStatus = battery
-		}
-
-		ds, err := getDeviceSettings(goDeviceInfo.deviceID)
-		if err != nil {
-			fmt.Printf("Get Device Settings for %s: %s\n", goDeviceInfo.deviceName, err)
-		} else {
-			goDeviceInfo.deviceSettings = ds
-		}
-	} else {
-		if goDeviceInfo.featureFlags.pairingList {
-			goDeviceInfo.pairingList = getPairingList(goDeviceInfo.deviceID)
-		}
+	if goDeviceInfo.isDongle {
+		goDeviceInfo.pairingList = emptyPairingList()
 	}
 
 	if isNewDevice := serialNumberCheck(goDeviceInfo); isNewDevice {
 		deviceManager.add(goDeviceInfo)
+		go loadDeviceDetails(goDeviceInfo)
 	}
 	C.Jabra_FreeDeviceInfo(deviceInfo)
 }
@@ -300,18 +287,41 @@ func deviceRemovedFunc(deviceID uint16) {
 // 	// }
 // }
 
-func updatePairingList() {
+func startPairingListUpdates() {
+	updateStopMu.Lock()
+	stopUpdatePairingList = make(chan struct{})
+	stop := stopUpdatePairingList
+	updateStopMu.Unlock()
+
+	go updatePairingList(stop)
+}
+
+func stopPairingListUpdates() {
+	updateStopMu.Lock()
+	defer updateStopMu.Unlock()
+	if stopUpdatePairingList == nil {
+		return
+	}
+	close(stopUpdatePairingList)
+	stopUpdatePairingList = nil
+}
+
+func updatePairingList(stop <-chan struct{}) {
 
 	for {
 		select {
-		case <-stopUpdatePairingList:
+		case <-stop:
 			return
 		default:
 			if dongle, exists := deviceManager[selectedDongle]; exists {
 				updatePairingList := getPairingList(dongle.deviceID)
-				dongle.pairingList.count = updatePairingList.count
-				dongle.pairingList.listType = updatePairingList.listType
-				dongle.pairingList.pairedDevices = updatePairingList.pairedDevices
+				if dongle.pairingList == nil {
+					dongle.pairingList = updatePairingList
+				} else {
+					dongle.pairingList.count = updatePairingList.count
+					dongle.pairingList.listType = updatePairingList.listType
+					dongle.pairingList.pairedDevices = updatePairingList.pairedDevices
+				}
 
 			}
 			time.Sleep(time.Second)
@@ -320,10 +330,29 @@ func updatePairingList() {
 
 }
 
-func batteryStatusUpdate() {
+func startBatteryStatusUpdates() {
+	updateStopMu.Lock()
+	stopUpdateBattery = make(chan struct{})
+	stop := stopUpdateBattery
+	updateStopMu.Unlock()
+
+	go batteryStatusUpdate(stop)
+}
+
+func stopBatteryStatusUpdates() {
+	updateStopMu.Lock()
+	defer updateStopMu.Unlock()
+	if stopUpdateBattery == nil {
+		return
+	}
+	close(stopUpdateBattery)
+	stopUpdateBattery = nil
+}
+
+func batteryStatusUpdate(stop <-chan struct{}) {
 	for {
 		select {
-		case <-stopUpdateBattery:
+		case <-stop:
 			return
 		default:
 			if device, exists := deviceManager[selectedHeadset]; exists {
@@ -331,6 +360,10 @@ func batteryStatusUpdate() {
 				if err != nil {
 					fmt.Println("Error getBatteryStatus")
 					return
+				}
+				if device.batteryStatus == nil {
+					device.batteryStatus = battery
+					continue
 				}
 				// Note: The battery percentage increases by a certain amount when charging (e.g., from 83% to 90%).
 				// The exact reason for this behavior is unclear but might be related to factors like the battery's charge cycle or charging efficiency.
@@ -405,7 +438,7 @@ func updateStartMenu() {
 
 	if dongle, dongleexists := deviceManager[selectedDongle]; dongleexists {
 		startMenu = append(startMenu, menuItem{id: 0, label: "Search For New Devices"})
-		if dongle.featureFlags.pairingList && dongle.pairingList.count != 0 {
+		if dongle.featureFlags.pairingList && dongle.pairingList != nil && dongle.pairingList.count != 0 {
 			startMenu = append(startMenu, menuItem{id: 1, label: "See Remembered Paired Devices"})
 		}
 		startMenu = append(startMenu, menuItem{id: 2, label: fmt.Sprintf("%s Settings", dongle.deviceName)})
@@ -470,6 +503,39 @@ func serialNumberCheck(deviceInfo *jabra_DeviceInfo) bool {
 	return isNewDevice
 }
 
+func emptyPairingList() *pairingList {
+	return &pairingList{
+		count:         0,
+		listType:      pairedDevices,
+		pairedDevices: make([]pairedDevice, 0),
+	}
+}
+
+func loadDeviceDetails(device *jabra_DeviceInfo) {
+	if device.isDongle {
+		if device.featureFlags.pairingList {
+			device.pairingList = getPairingList(device.deviceID)
+			updateStartMenu()
+		}
+		return
+	}
+
+	battery, err := getBatteryStatus(device.deviceID)
+	if err != nil {
+		fmt.Printf("Get Battery Status for %s: %s\n", device.deviceName, err)
+	} else {
+		device.batteryStatus = battery
+	}
+
+	ds, err := getDeviceSettings(device.deviceID)
+	if err != nil {
+		fmt.Printf("Get Device Settings for %s: %s\n", device.deviceName, err)
+	} else {
+		device.deviceSettings = ds
+		updateStartMenu()
+	}
+}
+
 func (d *devices) add(deviceInfo *jabra_DeviceInfo) {
 	if *d == nil {
 		*d = make(map[int]*jabra_DeviceInfo)
@@ -479,12 +545,12 @@ func (d *devices) add(deviceInfo *jabra_DeviceInfo) {
 	if deviceInfo.isDongle {
 		if selectedDongle == -1 {
 			selectedDongle = id
-			go updatePairingList()
+			startPairingListUpdates()
 		}
 	} else {
 		if selectedHeadset == -1 {
 			selectedHeadset = id
-			go batteryStatusUpdate()
+			startBatteryStatusUpdates()
 		}
 	}
 
@@ -534,11 +600,11 @@ func (d *devices) removed(deviceID uint16) {
 		nextIndex++
 	}
 	if !checkDongleExists {
-		stopUpdatePairingList <- struct{}{}
+		stopPairingListUpdates()
 		selectedDongle = -1
 	}
 	if !checkHeadSetExists {
-		stopUpdateBattery <- struct{}{}
+		stopBatteryStatusUpdates()
 		selectedHeadset = -1
 	}
 

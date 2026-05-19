@@ -389,6 +389,9 @@ func header() {
 		return
 	}
 	if headset.batteryStatus == nil {
+		moveCursor(2, width-35)
+		fmt.Printf("%s - Battery: Loading %s", headset.deviceName, loading[loadingIndex])
+		loadingIndex = (loadingIndex + 1) % len(loading)
 		return
 	}
 
